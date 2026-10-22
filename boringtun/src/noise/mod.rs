@@ -14,6 +14,11 @@ pub mod handshake;
 // apart. Still crate-private, so none of it is public API.
 pub(crate) mod imitation;
 pub mod rate_limiter;
+// AmneziaWG 1.5/2.0 custom signature packets I1..I5: the tag language and the
+// datagrams it generates ahead of each handshake initiation.
+pub mod signature;
+#[cfg(test)]
+mod signature_packet_tests;
 
 // AmneziaWG 3.0 header protection: ChaCha20 keystream mask, nonce from the junk prefix.
 pub mod header_protection;
@@ -142,10 +147,12 @@ pub struct Tunn {
 }
 
 struct PendingAmneziaJunk {
-    /// Pre-generated standalone imitation datagrams (DNS/SIP/STUN sequence or
-    /// browser QUIC Initials), each with the delay to wait before emitting it.
-    /// Emitted one per call before any random/protocol junk and the handshake
-    /// initiation; these use protocol-natural timing, not the Jd delay.
+    /// Pre-generated standalone datagrams, each with the delay to wait before
+    /// emitting it: the signature packets I1..I5 first, each with no delay,
+    /// then the imitation datagrams (DNS/SIP/STUN sequence or browser QUIC
+    /// Initials) with their protocol-natural timing. Emitted one per call
+    /// before any random/protocol junk and the handshake initiation; none of
+    /// them uses the Jd delay.
     imitation_datagrams: VecDeque<(Duration, Vec<u8>)>,
     remaining: u16,
     last_packet_at: Option<Instant>,
@@ -1576,18 +1583,22 @@ impl Tunn {
     /// The pre-handshake burst the current configuration calls for, ahead of
     /// an initiation: the one place a [`PendingAmneziaJunk`] is built.
     ///
-    /// Like wgbooster (execute_imitation_obfuscation then send_random_packets
-    /// then the handshake), the imitation sequence and the Jc
-    /// random/protocol-shaped junk are both emitted: the sequence first, then
-    /// `packet_count` junk packets, then the initiation. What is captured here
-    /// is only what cannot be read later -- the imitation datagrams, generated
-    /// whole, and the Jc count; everything else about the burst and the
-    /// initiation behind it is read from the configuration as each datagram
-    /// goes out.
+    /// Like amneziawg-go's `SendHandshakeInitiation` (the I-packets, then the
+    /// Jc junk, then the initiation) and wgbooster
+    /// (execute_imitation_obfuscation then send_random_packets then the
+    /// handshake), everything configured is emitted: the signature packets
+    /// I1..I5 first, in slot order, then the imitation sequence, then
+    /// `packet_count` junk packets, then the initiation. What is captured
+    /// here is only what cannot be read later -- the signature and imitation
+    /// datagrams, generated whole, and the Jc count; everything else about the
+    /// burst and the initiation behind it is read from the configuration as
+    /// each datagram goes out. The signature datagrams are generated here, for
+    /// this burst, and never carried over: a retransmission burst carries new
+    /// random bytes and the time it was built.
     ///
     /// When the configuration calls for no burst at all -- no Jc, no
-    /// imitation, or pre-handshake suppressed -- this is an empty burst: no
-    /// datagrams, nothing remaining. [`Self::advance_amnezia_junk`] treats that
+    /// imitation, no signature packet, or pre-handshake suppressed -- this is
+    /// an empty burst: no datagrams, nothing remaining. [`Self::advance_amnezia_junk`] treats that
     /// as "the initiation is due", which is what a pending burst whose
     /// configuration no longer has one must still say.
     ///
@@ -1611,11 +1622,20 @@ impl Tunn {
                 reset_expired_timers,
             };
         }
+        let amnezia = &self.amnezia;
+        let rng = &mut self.handshake.rng;
+        // The signature packets go first, each due at once: amneziawg-go
+        // sends them back to back ahead of the junk.
+        let mut datagrams: VecDeque<(Duration, Vec<u8>)> = amnezia
+            .signature_packets()
+            .iter()
+            .flatten()
+            .map(|packet| (Duration::from_millis(0), packet.generate(rng)))
+            .collect();
+        datagrams.extend(amnezia.pre_handshake_imitation_datagrams(rng));
         PendingAmneziaJunk {
-            imitation_datagrams: self
-                .amnezia
-                .pre_handshake_imitation_datagrams(&mut self.handshake.rng),
-            remaining: self.amnezia.pre_handshake_junk.packet_count,
+            imitation_datagrams: datagrams,
+            remaining: amnezia.pre_handshake_junk.packet_count,
             last_packet_at,
             reset_expired_timers,
         }

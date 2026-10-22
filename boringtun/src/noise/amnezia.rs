@@ -17,6 +17,7 @@ use super::{
 use crate::noise::errors::WireGuardError;
 use crate::noise::header_protection::{HeaderProtectionKey, NONCE_SIZE, TYPE_MASK_SIZE};
 use crate::noise::rate_limiter::CookieDefense;
+use crate::noise::signature::{SignaturePacket, SIGNATURE_PACKET_SLOTS};
 use rand_core::RngCore;
 use std::convert::{TryFrom, TryInto};
 use std::time::Duration;
@@ -49,7 +50,7 @@ const MAX_JUNK_PACKET_DELAY_MS: u16 = 200;
 /// configuration that would need it is only *reported*, by
 /// [`AmneziaConfig::cookie_amplification_complaint`]. The argument for it is
 /// there.
-const MAX_SENDABLE_DATAGRAM: usize = 65535 - 20 - 8;
+pub(crate) const MAX_SENDABLE_DATAGRAM: usize = 65535 - 20 - 8;
 /// AmneziaWG rounds unpadded transport plaintext up to this multiple, matching
 /// amneziawg-go's `PaddingMultiple` and vanilla WireGuard's 16-byte boundary.
 const PADDING_MULTIPLE: usize = 16;
@@ -396,6 +397,13 @@ pub struct AmneziaConfig {
     /// negotiated, so the two ends need not agree; S3 keeps its meaning,
     /// because the peer may still send cookie replies.
     pub(crate) disable_cookies: bool,
+    /// AmneziaWG 1.5/2.0 custom signature packets `I1`..`I5`, by slot; an
+    /// unset slot is `None`. Each set one is a standalone datagram generated
+    /// afresh and sent ahead of every handshake initiation, before the Jc junk,
+    /// in slot order (amneziawg-go `device/send.go`). Client-only: a server
+    /// never checks for them, so [`AmneziaConfig::as_responder`] drops them.
+    /// See [`crate::noise::signature`] for the tag language.
+    pub(crate) signature_packets: [Option<SignaturePacket>; SIGNATURE_PACKET_SLOTS],
 }
 
 /// What a live configuration change does to a pre-handshake burst already in
@@ -789,6 +797,7 @@ impl AmneziaConfig {
             timers: AwgTimers::default(),
             random_trailers: false,
             disable_cookies: false,
+            signature_packets: Default::default(),
         }
     }
 
@@ -854,12 +863,52 @@ impl AmneziaConfig {
         self
     }
 
+    /// Set the AmneziaWG 1.5/2.0 custom signature packets `I1`..`I5`, replacing
+    /// all five slots: `specs[0]` is `I1`. `None` leaves a slot unset, as does
+    /// a spec with no tags in it (amneziawg-go's reading of an empty value);
+    /// see [`SignaturePacket::parse`] for the tag language and its errors,
+    /// which come back here prefixed with the slot (`I2: unknown tag <x>`).
+    ///
+    /// Client-side: the set packets are generated afresh and sent ahead of
+    /// every handshake initiation (and every retransmission of one), in slot
+    /// order, before the Jc junk. They do not carry data and the server never
+    /// checks for them, so there is no need to set them on both ends;
+    /// [`Self::as_responder`] drops them.
+    pub fn with_signature_packets(
+        mut self,
+        specs: [Option<&str>; SIGNATURE_PACKET_SLOTS],
+    ) -> Result<Self, String> {
+        let mut packets: [Option<SignaturePacket>; SIGNATURE_PACKET_SLOTS] = Default::default();
+        for (slot, (packet, spec)) in packets.iter_mut().zip(specs.iter()).enumerate() {
+            *packet = match spec {
+                Some(spec) => {
+                    SignaturePacket::parse(spec).map_err(|e| format!("I{}: {}", slot + 1, e))?
+                }
+                None => None,
+            };
+        }
+        self.signature_packets = packets;
+        Ok(self)
+    }
+
+    /// The signature packets by slot: `[0]` is `I1`, and an unset slot is
+    /// `None`.
+    pub fn signature_packets(&self) -> &[Option<SignaturePacket>; SIGNATURE_PACKET_SLOTS] {
+        &self.signature_packets
+    }
+
+    /// Whether any signature packet is set.
+    pub(crate) fn has_signature_packets(&self) -> bool {
+        self.signature_packets.iter().any(Option::is_some)
+    }
+
     /// What switching from this configuration to `next` does to a
     /// pre-handshake burst already in flight -- see `Tunn::set_obfuscation`.
     ///
-    /// A burst captures only two things when it is built
-    /// (`Tunn::new_pre_handshake_burst`): the imitation datagrams, generated
-    /// whole, and the Jc count. Every other field is read when the next junk
+    /// A burst captures only three things when it is built
+    /// (`Tunn::new_pre_handshake_burst`): the signature datagrams and the
+    /// imitation datagrams, both generated whole, and the Jc count. Every
+    /// other field is read when the next junk
     /// datagram, the initiation or a transport frame actually goes out, so a
     /// change to it reaches the rest of the burst by itself and the burst is
     /// kept. A change to what was captured leaves the burst describing a
@@ -893,6 +942,9 @@ impl AmneziaConfig {
             random_trailers: _,
             // Receive policy: nothing this end sends depends on it.
             disable_cookies: _,
+            // The signature datagrams are generated whole when the burst is
+            // built.
+            signature_packets,
         } = self;
         let AmneziaPreHandshakeJunk {
             // Captured: how many junk datagrams the burst still owes.
@@ -906,6 +958,7 @@ impl AmneziaConfig {
         if *packet_count != next.pre_handshake_junk.packet_count
             || *imitation != next.imitation
             || *suppress_pre_handshake != next.suppress_pre_handshake
+            || *signature_packets != next.signature_packets
         {
             PendingBurstChange::Restart
         } else {
@@ -1515,8 +1568,14 @@ impl AmneziaConfig {
     /// (`fill_outbound_junk`), so the server's own traffic keeps the
     /// same byte distribution as the client's. Only the *standalone* datagrams
     /// are suppressed.
+    ///
+    /// The signature packets `I1`..`I5` are standalone datagrams of the same
+    /// kind -- a client's opening, which a server never checks for -- and are
+    /// dropped outright rather than kept and suppressed: a responder has no
+    /// use for them, and a dump of its configuration should not list them.
     pub fn as_responder(mut self) -> Self {
         self.suppress_pre_handshake = true;
+        self.signature_packets = Default::default();
         self
     }
 
@@ -1555,11 +1614,14 @@ impl AmneziaConfig {
     }
 
     /// True when this endpoint should emit a pre-handshake burst at all —
-    /// false for a responder, and for a client with neither Jc nor imitation.
+    /// false for a responder, and for a client with no Jc, no imitation and
+    /// no signature packet.
     pub(crate) fn emits_pre_handshake(&self) -> bool {
         !self.suppress_pre_handshake
             && self.imitation.protocol != AmneziaImitationProtocol::Auto
-            && (self.pre_handshake_junk.is_enabled() || self.has_imitation_sequence())
+            && (self.pre_handshake_junk.is_enabled()
+                || self.has_imitation_sequence()
+                || self.has_signature_packets())
     }
 
     /// The configured imitation host, or a generated random one (DNS query name
@@ -2458,15 +2520,27 @@ impl AmneziaConfig {
         random_usize_inclusive(lo, hi, rng)
     }
 
-    /// The largest Jc junk datagram the next draw can produce, without
-    /// drawing: 0 when Jc is off (the fill then writes nothing).
-    /// `random_usize_inclusive` never exceeds `max(lo, hi)`.
+    /// The largest datagram the pre-handshake burst's generated part can
+    /// produce: the Jc draw's upper bound (0 when Jc is off; the fill then
+    /// writes nothing, and `random_usize_inclusive` never exceeds
+    /// `max(lo, hi)`) or the largest signature packet, whichever is more, so
+    /// a buffer sized to it carries every datagram of the burst but the
+    /// imitation sequence. Read without drawing: the Jc capacity preflight
+    /// admits against it, and a signature packet's exact size is known from
+    /// its spec.
     pub(crate) fn pre_handshake_junk_max_size(&self) -> usize {
+        let signature = self
+            .signature_packets
+            .iter()
+            .flatten()
+            .map(SignaturePacket::max_len)
+            .max()
+            .unwrap_or(0);
         if !self.pre_handshake_junk.is_enabled() {
-            return 0;
+            return signature;
         }
         let (lo, hi) = self.pre_handshake_junk_size_range();
-        lo.max(hi)
+        lo.max(hi).max(signature)
     }
 
     fn fill_outbound_junk(&self, dst: &mut [u8], trailing_size: usize, rng: &mut impl RngCore) {

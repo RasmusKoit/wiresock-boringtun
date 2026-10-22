@@ -1176,6 +1176,21 @@ impl AmneziaConfig {
         self.header_protection.is_set()
     }
 
+    /// The AmneziaWG 3.0 header-protection keystream bytes that unmask a
+    /// message-type field in `datagram`: XORed with the four bytes at the
+    /// message's offset (after its S1-S4 prefix), they give the type field,
+    /// which the H1-H4 ranges then classify. The same four bytes apply at
+    /// every offset, because the sender starts its keystream at the message,
+    /// whatever the padding in front of it. For a caller that knows the key
+    /// and wants to classify a protected datagram without decapsulating it.
+    ///
+    /// `None` when header protection is off (the type field is then in the
+    /// clear) or when `datagram` is shorter than the 12-byte nonce its prefix
+    /// carries, and so too short for any packet kind.
+    pub fn header_type_mask(&self, datagram: &[u8]) -> Option<[u8; TYPE_MASK_SIZE]> {
+        self.header_protection.type_mask(datagram)
+    }
+
     /// S1..S4 with their names, in packet-kind order.
     fn labelled_junk_sizes(&self) -> [(&'static str, u16); 4] {
         [
@@ -5209,5 +5224,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `header_type_mask` hands a caller the keystream that unmasks a
+    /// protected message's type field: XORed over the four bytes after the S1
+    /// prefix of an initiation this configuration framed, it yields a tag the
+    /// H1 range matches. None without a key, or for a datagram too short to
+    /// carry the nonce.
+    #[test]
+    fn header_type_mask_unmasks_a_protected_initiations_type_field() {
+        use crate::noise::Tunn;
+        use rand_core::OsRng;
+
+        let key = [0x42u8; 32];
+        let protected = AmneziaConfig::new(16, 16, 16, 16).with_header_protection(key);
+        let obf = ObfuscationRanges::new(10, 20, 30, 40, 50, 60, 70, 80).unwrap();
+        let sk = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let peer =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        let mut tunn =
+            Tunn::new_with_obfuscation(sk, peer, None, None, 0x1234, None, obf, protected.clone())
+                .unwrap();
+        let mut buf = [0u8; 2048];
+        let wire = match tunn.format_handshake_initiation(&mut buf, false) {
+            crate::noise::TunnResult::WriteToNetwork(p) => p.to_vec(),
+            other => panic!("expected an initiation, got {:?}", other),
+        };
+        assert_eq!(wire.len(), 16 + HANDSHAKE_INIT_SZ);
+
+        let mask = protected
+            .header_type_mask(&wire)
+            .expect("the key is set and the datagram carries a nonce");
+        let masked: [u8; 4] = wire[16..20].try_into().unwrap();
+        let mut tag = [0u8; 4];
+        for i in 0..4 {
+            tag[i] = masked[i] ^ mask[i];
+        }
+        assert!(
+            obf.matches_h1(u32::from_le_bytes(tag)),
+            "unmasked tag {:?} is in H1",
+            tag
+        );
+        assert_ne!(masked, tag, "the field on the wire is masked");
+
+        // Without a key the field is in the clear and there is no mask.
+        assert_eq!(
+            AmneziaConfig::new(16, 16, 16, 16).header_type_mask(&wire),
+            None
+        );
+        // Too short to carry the 12-byte nonce.
+        assert_eq!(protected.header_type_mask(&wire[..11]), None);
+        assert!(protected.header_type_mask(&wire[..12]).is_some());
     }
 }

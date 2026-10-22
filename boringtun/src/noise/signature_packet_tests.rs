@@ -300,3 +300,36 @@ fn the_builder_and_the_configuration_account_for_the_packets() {
         PendingBurstChange::Restart
     );
 }
+
+/// `has_pending_pre_handshake` is true from the first datagram of a burst
+/// until the initiation leaves, and a call after that is `Done` without a
+/// new handshake being started.
+#[test]
+fn has_pending_pre_handshake_tracks_the_burst() {
+    let client = plain().with_pre_handshake_junk(2, 100, 100, 0);
+    let (mut c, _s) = pair(client, plain());
+    let mut buf = [0u8; 2048];
+    assert!(
+        !c.has_pending_pre_handshake(),
+        "nothing before the first call"
+    );
+
+    let first = net(c.format_handshake_initiation(&mut buf, false));
+    assert_eq!(first.len(), 100, "the first junk datagram");
+    assert!(c.has_pending_pre_handshake());
+
+    let second = net(c.format_handshake_initiation(&mut buf, false));
+    assert_eq!(second.len(), 100, "the second junk datagram");
+    assert!(c.has_pending_pre_handshake());
+
+    let init = net(c.format_handshake_initiation(&mut buf, false));
+    assert!(is_initiation(&c, &init));
+    assert!(!c.has_pending_pre_handshake(), "the burst is spent");
+
+    // The handshake is in flight: no new burst, no second initiation.
+    assert!(matches!(
+        c.format_handshake_initiation(&mut buf, false),
+        TunnResult::Done
+    ));
+    assert!(!c.has_pending_pre_handshake());
+}

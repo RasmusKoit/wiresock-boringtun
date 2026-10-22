@@ -1551,6 +1551,23 @@ impl Tunn {
         Ok(self.validate_decapsulated_packet(&mut dst[..len]))
     }
 
+    /// Whether a pre-handshake burst (AmneziaWG signature packets, imitation
+    /// datagrams and Jc junk ahead of a handshake initiation) is in progress.
+    ///
+    /// While this is true the caller keeps calling
+    /// [`Self::format_handshake_initiation`] with `force_resend = false` to
+    /// receive the rest of the burst, one datagram per call: the remaining
+    /// signature packets, the imitation datagrams, the junk, then the
+    /// initiation, after which this is false. `Done` from such a call means
+    /// the next datagram is not due yet (its Jd or protocol delay has not
+    /// elapsed), not that the burst is over. The other drivers do not finish
+    /// a burst on their own: `decapsulate(None, &[], dst)` advances it only
+    /// while an application packet is queued, and `update_timers` emits at
+    /// most one datagram per tick.
+    pub fn has_pending_pre_handshake(&self) -> bool {
+        self.pending_amnezia_junk.is_some()
+    }
+
     /// Formats a new handshake initiation message and store it in dst. If force_resend is true will send
     /// a new handshake, even if a handshake is already in progress (for example when a handshake times out)
     pub fn format_handshake_initiation<'a>(

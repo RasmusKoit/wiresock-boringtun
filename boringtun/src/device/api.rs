@@ -113,6 +113,10 @@ struct AwgParams {
     max_handshake_attempts: Option<(u32, u32)>,
     random_trailers: Option<bool>,
     disable_cookies: Option<bool>,
+    /// `i1`..`i5` by slot: the spec as written, `Some` for every key the
+    /// transaction carried, an empty value included -- amneziawg-go reads an
+    /// empty value as "unset", and so does `AmneziaConfig::with_signature_packets`.
+    signature_packets: [Option<String>; 5],
     seen: bool,
 }
 
@@ -133,6 +137,19 @@ impl AwgParams {
 
     fn set_header_protection(&mut self, key: [u8; 32]) {
         self.header_protection = Some(key);
+        self.seen = true;
+    }
+
+    fn set_signature_packet(&mut self, key: &str, spec: &str) {
+        let slot = match key {
+            "i1" => 0,
+            "i2" => 1,
+            "i3" => 2,
+            "i4" => 3,
+            "i5" => 4,
+            _ => unreachable!("caller matched the key"),
+        };
+        self.signature_packets[slot] = Some(spec.to_owned());
         self.seen = true;
     }
 
@@ -276,6 +293,27 @@ impl AwgParams {
         // transaction come to the same answer.
         let current_cookies = amnezia.disable_cookies;
         amnezia = amnezia.with_disable_cookies(self.disable_cookies.unwrap_or(current_cookies));
+
+        // Signature packets: each slot this transaction carried, else
+        // whatever is already set, re-parsed from the spec it was set from. A
+        // spec that does not parse fails the transaction with EINVAL and a log
+        // line naming the slot and the tag, as amneziawg-go refuses it
+        // (`failed to parse I1: ...`).
+        let current_packets = amnezia.signature_packets().clone();
+        let mut specs: [Option<&str>; 5] = [None; 5];
+        for (slot, (new, current)) in specs
+            .iter_mut()
+            .zip(self.signature_packets.iter().zip(current_packets.iter()))
+        {
+            *slot = match new {
+                Some(spec) => Some(spec.as_str()),
+                None => current.as_ref().map(|packet| packet.spec()),
+            };
+        }
+        amnezia = amnezia.with_signature_packets(specs).map_err(|e| {
+            tracing::error!(message = "rejecting AmneziaWG signature packet", error = %e);
+            EINVAL
+        })?;
 
         // Timers: each range this transaction carried, else whatever is
         // already set. `(0, 0)` is amneziawg-go's "unset" -- the built-in
@@ -653,6 +691,15 @@ fn write_awg_interface_params(
         }
     }
 
+    // The signature packets, each set slot as the spec it was set from, so a
+    // dump reapplies: amneziawg-go prints `i%d=%s` for every non-nil slot,
+    // after the H ranges and before the header-protection key.
+    for (slot, packet) in a.signature_packets().iter().enumerate() {
+        if let Some(packet) = packet {
+            writeln!(writer, "i{}={}", slot + 1, packet.spec());
+        }
+    }
+
     // The padding range and the five tunable timers, when set. amneziawg-go
     // emits each of these only when non-zero (`!IsZero()` in
     // `IpcGetOperation`), so unset stays absent and a vanilla device's output
@@ -899,10 +946,11 @@ fn api_set(reader: &mut BufReader<&UnixStream>, d: &mut LockReadGuard<Device>) -
                             Some(on) => awg.set_disable_cookies(on),
                             None => return EINVAL,
                         },
-                        // AWG 2.0 signature packets. A responder only has to
-                        // tolerate these; accept and ignore rather than failing
-                        // the whole transaction on a config that carries them.
-                        "i1" | "i2" | "i3" | "i4" | "i5" => {}
+                        // AmneziaWG 1.5/2.0 signature packets, sent ahead of
+                        // every handshake initiation. Staged with the other
+                        // AmneziaWG keys and parsed in `merged`, where a bad
+                        // spec fails the transaction with EINVAL.
+                        "i1" | "i2" | "i3" | "i4" | "i5" => awg.set_signature_packet(key, val),
                         // Both ends must carry the same key: it is not negotiated
                         // and there is no in-band signal, so a mismatch is a
                         // tunnel that never forms rather than one that degrades.
@@ -1685,6 +1733,92 @@ mod tests {
             .merged(ObfuscationRanges::default(), &current, 1420)
             .expect("valid");
         assert_eq!(again, cfg);
+    }
+
+    /// `i1`..`i5` over the UAPI: a slot the transaction carries is set from
+    /// its spec, one it does not mention keeps what is set, an empty value
+    /// unsets (amneziawg-go's reading), a spec that does not parse fails the
+    /// transaction with EINVAL, and the set slots are emitted as `i%d=%s` by
+    /// slot -- so a `get=1` dump reapplies.
+    #[test]
+    fn signature_packets_over_the_uapi_apply_by_slot_and_round_trip() {
+        let current = AmneziaConfig::new(52, 108, 136, 148);
+        let mut set = AwgParams::default();
+        set.set_signature_packet("i1", "<b 0x16030100><r 32>");
+        set.set_signature_packet("i3", "<rc 12><t>");
+        let (_, cfg) = set
+            .merged(ObfuscationRanges::default(), &current, 1420)
+            .expect("valid");
+        let packets = cfg.signature_packets();
+        assert_eq!(
+            packets[0].as_ref().map(|p| p.spec()),
+            Some("<b 0x16030100><r 32>")
+        );
+        assert!(packets[1].is_none());
+        assert_eq!(packets[2].as_ref().map(|p| p.spec()), Some("<rc 12><t>"));
+        assert!(packets[3].is_none() && packets[4].is_none());
+        assert!(cfg.emits_pre_handshake(), "a client with I-packets bursts");
+
+        // A later transaction that does not mention them keeps them, and one
+        // that mentions one slot changes only that slot.
+        let mut untouched = AwgParams::default();
+        untouched.set_size("s1", 60);
+        let (_, kept) = untouched
+            .merged(ObfuscationRanges::default(), &cfg, 1420)
+            .expect("valid");
+        assert_eq!(kept.signature_packets(), cfg.signature_packets());
+
+        let mut one = AwgParams::default();
+        one.set_signature_packet("i2", "<rd 4>");
+        one.set_signature_packet("i3", "");
+        let (_, changed) = one
+            .merged(ObfuscationRanges::default(), &cfg, 1420)
+            .expect("valid");
+        let packets = changed.signature_packets();
+        assert_eq!(packets[0], cfg.signature_packets()[0], "i1 kept");
+        assert_eq!(packets[1].as_ref().map(|p| p.spec()), Some("<rd 4>"));
+        assert!(packets[2].is_none(), "an empty value unsets the slot");
+
+        let mut bad = AwgParams::default();
+        bad.set_signature_packet("i4", "<b 0x123>");
+        assert_eq!(
+            bad.merged(ObfuscationRanges::default(), &cfg, 1420).err(),
+            Some(EINVAL)
+        );
+        let mut too_big = AwgParams::default();
+        too_big.set_signature_packet("i5", "<r 65508>");
+        assert_eq!(
+            too_big
+                .merged(ObfuscationRanges::default(), &cfg, 1420)
+                .err(),
+            Some(EINVAL)
+        );
+
+        // The emit side, and back.
+        let emit = |a: &AmneziaConfig| {
+            let mut out = Vec::new();
+            write_awg_interface_params(&mut out, &ObfuscationRanges::default(), a);
+            String::from_utf8(out).expect("utf8")
+        };
+        let dump = emit(&cfg);
+        assert!(dump.contains("i1=<b 0x16030100><r 32>\n"), "{}", dump);
+        assert!(!dump.contains("i2="), "{}", dump);
+        assert!(dump.contains("i3=<rc 12><t>\n"), "{}", dump);
+        assert!(!emit(&current).contains("i1="), "{}", emit(&current));
+        let mut reapplied = AwgParams::default();
+        for line in dump.lines() {
+            let (key, val) = line.split_once('=').unwrap();
+            if matches!(key, "i1" | "i2" | "i3" | "i4" | "i5") {
+                reapplied.set_signature_packet(key, val);
+            }
+        }
+        let (_, again) = reapplied
+            .merged(ObfuscationRanges::default(), &current, 1420)
+            .expect("valid");
+        assert_eq!(again, cfg);
+
+        // A responder's configuration lists none.
+        assert!(!emit(&cfg.as_responder()).contains("i1="));
     }
 
     /// `disable_cookies` over the UAPI: the `strconv.ParseBool` spellings
